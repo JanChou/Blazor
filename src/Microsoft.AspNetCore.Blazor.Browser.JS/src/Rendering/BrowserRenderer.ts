@@ -6,31 +6,65 @@ let raiseEventMethod: MethodHandle;
 let renderComponentMethod: MethodHandle;
 
 export class BrowserRenderer {
-  private childComponentLocations: { [componentId: number]: Element } = {};
+  private childComponentLocations: { [componentId: number]: Node } = {};
 
   constructor(private browserRendererId: number) {
   }
 
   public attachComponentToElement(componentId: number, element: Element) {
-    this.childComponentLocations[componentId] = element;
+    this.insertComponentMarker(componentId, element, 0);
   }
 
   public updateComponent(componentId: number, edits: System_Array<RenderTreeEditPointer>, editsOffset: number, editsLength: number, referenceFrames: System_Array<RenderTreeFramePointer>) {
-    const element = this.childComponentLocations[componentId];
-    if (!element) {
-      throw new Error(`No element is currently associated with component ${componentId}`);
+    const marker = this.childComponentLocations[componentId];
+    if (!marker) {
+      throw new Error(`No location is currently associated with component ${componentId}`);
     }
 
-    this.applyEdits(componentId, element, 0, edits, editsOffset, editsLength, referenceFrames);
+    let parent: Element;
+    let childIndex: number;
+    let nodeCount: number;
+    let isWrapped = false;
+    if (marker instanceof Comment) { // TODO: Only if it's the marker for *this* component
+      parent = marker.parentElement!;
+      childIndex = Array.prototype.indexOf.call(parent.childNodes, marker);
+      nodeCount = 0;
+      parent.removeChild(marker);
+    } else if (marker instanceof Element && marker.tagName === 'BLAZOR-COMPONENT') { // TODO: Only if it's the wrapper for *this* component
+      parent = marker;
+      childIndex = 0;
+      nodeCount = parent.childNodes.length;
+      isWrapped = true;
+    } else {
+      parent = marker.parentElement!;
+      childIndex = Array.prototype.indexOf.call(parent.childNodes, marker);
+      nodeCount = 1;
+    }
+
+    nodeCount += this.applyEdits(componentId, parent, childIndex, edits, editsOffset, editsLength, referenceFrames);
+
+    if (!isWrapped) {
+      if (nodeCount === 1) {
+        this.childComponentLocations[componentId] = parent.childNodes[childIndex];
+      } else {
+        const wrapper = document.createElement('blazor-component');
+        insertNodeIntoDOM(wrapper, parent, childIndex);
+        for (let i = 0; i < nodeCount; i++) {
+          wrapper.appendChild(parent.childNodes[childIndex + 1]);
+        }
+        this.childComponentLocations[componentId] = wrapper;
+      }
+    }
   }
 
   public disposeComponent(componentId: number) {
     delete this.childComponentLocations[componentId];
   }
 
-  applyEdits(componentId: number, parent: Element, childIndex: number, edits: System_Array<RenderTreeEditPointer>, editsOffset: number, editsLength: number, referenceFrames: System_Array<RenderTreeFramePointer>) {
+  applyEdits(componentId: number, parent: Element, childIndex: number, edits: System_Array<RenderTreeEditPointer>, editsOffset: number, editsLength: number, referenceFrames: System_Array<RenderTreeFramePointer>): number {
     let currentDepth = 0;
     let childIndexAtCurrentDepth = childIndex;
+    let topLevelNodeCountChange = 0;
     const maxEditIndexExcl = editsOffset + editsLength;
     for (let editIndex = editsOffset; editIndex < maxEditIndexExcl; editIndex++) {
       const edit = getRenderTreeEditPtr(edits, editIndex);
@@ -40,12 +74,19 @@ export class BrowserRenderer {
           const frameIndex = renderTreeEdit.newTreeIndex(edit);
           const frame = getTreeFramePtr(referenceFrames, frameIndex);
           const siblingIndex = renderTreeEdit.siblingIndex(edit);
-          this.insertFrame(componentId, parent, childIndexAtCurrentDepth + siblingIndex, referenceFrames, frame, frameIndex);
+          const numNodesInserted = this.insertFrame(componentId, parent, childIndexAtCurrentDepth + siblingIndex, referenceFrames, frame, frameIndex);
+          if (currentDepth === 0) {
+            topLevelNodeCountChange += numNodesInserted;
+          }
           break;
         }
         case EditType.removeFrame: {
           const siblingIndex = renderTreeEdit.siblingIndex(edit);
+          // TODO: Does removing Range frames work correctly?
           removeNodeFromDOM(parent, childIndexAtCurrentDepth + siblingIndex);
+          if (currentDepth === 0) {
+            topLevelNodeCountChange -= 1;
+          }
           break;
         }
         case EditType.setAttribute: {
@@ -88,6 +129,8 @@ export class BrowserRenderer {
         }
       }
     }
+
+    return topLevelNodeCountChange;
   }
 
   insertFrame(componentId: number, parent: Element, childIndex: number, frames: System_Array<RenderTreeFramePointer>, frame: RenderTreeFramePointer, frameIndex: number): number {
@@ -133,28 +176,16 @@ export class BrowserRenderer {
   }
 
   insertComponent(parent: Element, childIndex: number, frame: RenderTreeFramePointer) {
-    // Currently, to support O(1) lookups from render tree frames to DOM nodes, we rely on
-    // each child component existing as a single top-level element in the DOM. To guarantee
-    // that, we wrap child components in these 'blazor-component' wrappers.
-    // To improve on this in the future:
-    // - If we can statically detect that a given component always produces a single top-level
-    //   element anyway, then don't wrap it in a further nonstandard element
-    // - If we really want to support child components producing multiple top-level frames and
-    //   not being wrapped in a container at all, then every time a component is refreshed in
-    //   the DOM, we could update an array on the parent element that specifies how many DOM
-    //   nodes correspond to each of its render tree frames. Then when that parent wants to
-    //   locate the first DOM node for a render tree frame, it can sum all the frame counts for
-    //   all the preceding render trees frames. It's O(N), but where N is the number of siblings
-    //   (counting child components as a single item), so N will rarely if ever be large.
-    //   We could even keep track of whether all the child components happen to have exactly 1
-    //   top level frames, and in that case, there's no need to sum as we can do direct lookups.
-    const containerElement = document.createElement('blazor-component');
-    insertNodeIntoDOM(containerElement, parent, childIndex);
-
     // All we have to do is associate the child component ID with its location. We don't actually
     // do any rendering here, because the diff for the child will appear later in the render batch.
     const childComponentId = renderTreeFrame.componentId(frame);
-    this.attachComponentToElement(childComponentId, containerElement);
+    this.insertComponentMarker(childComponentId, parent, childIndex);
+  }
+
+  insertComponentMarker(componentId: number, parent: Element, childIndex: number) {
+    const marker = document.createComment('blazor-component');
+    insertNodeIntoDOM(marker, parent, childIndex);
+    this.childComponentLocations[componentId] = marker;
   }
 
   insertText(parent: Element, childIndex: number, textFrame: RenderTreeFramePointer) {

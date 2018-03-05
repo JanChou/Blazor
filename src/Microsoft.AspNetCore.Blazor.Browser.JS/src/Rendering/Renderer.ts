@@ -17,8 +17,8 @@ export function attachComponentToElement(browserRendererId: number, elementSelec
   if (!browserRenderer) {
     browserRenderer = browserRenderers[browserRendererId] = new BrowserRenderer(browserRendererId);
   }
-  browserRenderer.attachComponentToElement(componentId, element);
   clearElement(element);
+  browserRenderer.attachComponentToElement(componentId, element);
 }
 
 export function renderBatch(browserRendererId: number, batch: RenderBatchPointer) {
